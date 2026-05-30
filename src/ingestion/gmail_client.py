@@ -178,10 +178,21 @@ def save_email(email: dict, save_attachments: bool = True):
 
 
 def main():
-    """CLI entry point for fetching emails."""
+    """CLI entry point for fetching emails.
+
+    Usage: email-ingest [--limit N]
+    """
+    import sys
     from rich.console import Console
     from rich.progress import Progress
     console = Console()
+
+    # Parse --limit
+    limit = 100
+    if "--limit" in sys.argv:
+        idx = sys.argv.index("--limit")
+        if idx + 1 < len(sys.argv):
+            limit = int(sys.argv[idx + 1])
 
     state = PipelineStateManager()
 
@@ -191,9 +202,9 @@ def main():
     if os.path.exists(raw_dir):
         existing = {f.replace(".json", "") for f in os.listdir(raw_dir) if f.endswith(".json")}
 
-    console.print("[bold]Fetching emails from Gmail...[/bold]")
+    console.print(f"[bold]Fetching up to {limit} emails from Gmail...[/bold]")
     client = GmailClient()
-    emails = client.fetch_emails(max_results=100)
+    emails = client.fetch_emails(max_results=limit)
     console.print(f"Fetched {len(emails)} emails from Gmail API")
 
     # Filter out already-fetched

@@ -8,6 +8,7 @@ Handles:
 import ollama
 from config.settings import config
 from src.ollama_lock import get_model_lock
+from src.ollama_lock import get_model_lock
 
 # Classify image attachments
 CLASSIFY_PROMPT = """Classify this image into exactly ONE category. Reply with ONLY the category name, nothing else.

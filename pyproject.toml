@@ -32,6 +32,7 @@ dependencies = [
 [project.scripts]
 email-ingest = "src.ingestion.gmail_client:main"
 email-preprocess = "src.preprocessing.pipeline:main"
+email-embed = "src.preprocessing.pipeline:main_embed"
 email-chat = "src.chat.app:main"
 email-status = "src.cli:status"
 email-resume = "src.cli:resume"

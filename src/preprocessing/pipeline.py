@@ -3,18 +3,20 @@
 Pipeline stages:
 fetched → cleaned → llm_extracted → vlm_processed → embedded → stored
 
-Features:
-- Persists state after every email — survives crashes/kills
-- Resume from where it left off
-- Deduplicates Qdrant chunks on re-run
-- Real-time progress display
+Three independent entry points:
+- run_preprocess(): only LLM/VLM extraction (saves to data/processed/)
+- run_embed(): only chunk/embed/store (reads from data/processed/)
+- run(): both phases together (legacy, for convenience)
+
+Each can be run independently, resumed, and stopped at any time.
+Chat always works with whatever is in Qdrant.
 """
 
 import json
 import os
+import sys
 from datetime import datetime
 from rich.console import Console
-from rich.progress import Progress
 
 from config.settings import config
 from src.embedding.embedder import EmailChunker, EmailEmbedder
@@ -32,6 +34,25 @@ console = Console()
 display = ProgressDisplay(console)
 
 
+def _load_raw_emails(limit: int = 0) -> list[dict]:
+    """Load raw emails from data/raw_emails/."""
+    raw_dir = "data/raw_emails"
+    if not os.path.exists(raw_dir):
+        return []
+
+    emails = []
+    for filename in sorted(os.listdir(raw_dir)):
+        if filename.endswith(".json"):
+            with open(os.path.join(raw_dir, filename)) as f:
+                email = json.load(f)
+                email["date"] = datetime.fromisoformat(email["date"])
+                emails.append(email)
+            if limit > 0 and len(emails) >= limit:
+                break
+
+    return emails
+
+
 class PreprocessingPipeline:
     def __init__(self, state_manager: PipelineStateManager = None):
         self.body_cleaner = EmailBodyCleaner()
@@ -44,27 +65,20 @@ class PreprocessingPipeline:
         self.state = state_manager or PipelineStateManager()
 
     def process_single_email(self, email: dict, index: int = 0, total: int = 0) -> ProcessedEmail:
-        """Run the full preprocessing pipeline on a single email.
-
-        Tracks progress through each stage. Saves immediately on completion.
-        """
+        """Run the full preprocessing pipeline on a single email."""
         mid = email["message_id"]
         subject = email.get("subject", "")[:50]
         sender = email.get("sender", "")
+        attachments = email.get("attachments", [])
 
-        # Update display
         if total > 0:
             display.show_current(subject, sender, "cleaned", index, total)
 
-        # ═══════════════════════════════════════════════
-        # STAGE 1: Body cleaning (flag, never delete)
-        # ═══════════════════════════════════════════════
+        # ── Stage 1: Body cleaning ──
         cleaned = self.body_cleaner.clean(email.get("raw_body", ""))
         self.state.set_stage(mid, PipelineStage.CLEANED)
 
-        # ═══════════════════════════════════════════════
-        # STAGE 2: Attachment processing
-        # ═══════════════════════════════════════════════
+        # ── Stage 2: Attachment processing ──
         if total > 0:
             display.show_current(subject, sender, "vlm_processed", index, total)
 
@@ -87,9 +101,6 @@ class PreprocessingPipeline:
                     )
                     attachment_page_descriptions.extend(page_descs)
                     attachment_info.extend(page_descs)
-
-                if doc.is_scanned and not doc.images:
-                    attachment_info.append(f"[{att.filename}]: Scanned document — install pdf2image for VLM page analysis")
 
                 continue
 
@@ -114,9 +125,7 @@ class PreprocessingPipeline:
 
         self.state.set_stage(mid, PipelineStage.VLM_PROCESSED)
 
-        # ═══════════════════════════════════════════════
-        # STAGE 3: LLM extraction (maximum detail)
-        # ═══════════════════════════════════════════════
+        # ── Stage 3: LLM extraction ──
         if total > 0:
             display.show_current(subject, sender, "llm_extracted", index, total)
 
@@ -131,11 +140,9 @@ class PreprocessingPipeline:
         )
         self.state.set_stage(mid, PipelineStage.LLM_EXTRACTED)
 
-        # ═══════════════════════════════════════════════
-        # STAGE 4: Build processed email
-        # ═══════════════════════════════════════════════
+        # ── Build ProcessedEmail ──
         result = ProcessedEmail(
-            message_id=email["message_id"],
+            message_id=mid,
             thread_id=email["thread_id"],
             subject=email["subject"],
             sender=email["sender"],
@@ -180,34 +187,28 @@ class PreprocessingPipeline:
             links=cleaned.links,
         )
 
-        # Save processed email IMMEDIATELY — don't wait for batch
+        # Save IMMEDIATELY
         self._save_processed_email(result)
-
         return result
 
     def _save_processed_email(self, email: ProcessedEmail):
-        """Save a single processed email to disk immediately."""
+        """Save a single processed email to disk."""
         os.makedirs("data/processed", exist_ok=True)
         filepath = f"data/processed/{email.message_id}.json"
         with open(filepath, "w") as f:
             f.write(email.model_dump_json(indent=2))
 
     def embed_and_store_single(self, email: ProcessedEmail, index: int = 0, total: int = 0):
-        """Chunk, embed, and store a single processed email.
-
-        Deduplicates: deletes existing chunks for this message_id before upserting.
-        """
+        """Chunk, embed, and store a single processed email."""
         mid = email.message_id
-        subject = email.subject[:50]
-        sender = email.sender
 
         if total > 0:
-            display.show_current(subject, sender, "embedded", index, total)
+            display.show_current(email.subject[:50], email.sender, "embedded", index, total)
 
-        # Deduplicate: remove old chunks for this email from Qdrant
+        # Deduplicate
         self.store.delete_by_message_id(mid)
 
-        # Build searchable text from ALL extracted data
+        # Build searchable text
         email_dict = {
             "message_id": email.message_id,
             "subject": email.subject,
@@ -238,17 +239,12 @@ class PreprocessingPipeline:
             "raw_body": email.cleaned_body,
         }
 
-        # Chunk
         chunks = self.chunker.chunk_email(email_dict)
 
         if chunks:
-            # Embed
             texts = [c["text"] for c in chunks]
             embeddings = self.embedder.embed_batch(texts)
-
-            # Store
             self.store.upsert_chunks(chunks, embeddings)
-
             email.chunks = [c["text"] for c in chunks]
             email.embedding_ids = [c["id"] for c in chunks]
 
@@ -256,86 +252,107 @@ class PreprocessingPipeline:
         self.state.set_chunks_created(mid, len(chunks))
         self.state.set_stage(mid, PipelineStage.STORED)
 
-    def run(self, emails: list[dict]) -> list[ProcessedEmail]:
-        """Run the complete pipeline with tracking and resumability.
+    # ── Independent entry points ──
 
-        - Skips emails already at 'stored' stage
-        - Saves state after every email
-        - Handles KeyboardInterrupt gracefully (saves state, marks paused)
-        - Deduplicates Qdrant on re-run
+    def run_preprocess(self, emails: list[dict], limit: int = 0) -> list[ProcessedEmail]:
+        """Only preprocess (LLM/VLM extraction). Does NOT embed.
+
+        Saves each processed email to data/processed/ immediately.
+        Chat won't see these until you run run_embed().
         """
-        total = len(emails)
+        if limit > 0:
+            emails = emails[:limit]
 
-        # Register all emails in state
+        # Register
         subjects = {e["message_id"]: e.get("subject", "") for e in emails}
         senders = {e["message_id"]: e.get("sender", "") for e in emails}
-        self.state.register_emails(
-            [e["message_id"] for e in emails],
-            subjects=subjects,
-            senders=senders,
-        )
+        self.state.register_emails([e["message_id"] for e in emails], subjects=subjects, senders=senders)
 
-        # Phase 1: Process emails (skip already extracted)
+        # Filter to those needing preprocessing
         needs_processing = self.state.get_emails_needing_processing(PipelineStage.LLM_EXTRACTED)
-        emails_to_process = [e for e in emails if e["message_id"] in needs_processing]
+        to_process = [e for e in emails if e["message_id"] in needs_processing]
 
-        if not emails_to_process:
-            console.print("[green]All emails already processed — skipping Phase 1[/green]")
-        else:
-            console.print(f"\n[bold]Phase 1: Processing {len(emails_to_process)} emails...[/bold]")
-            processed = []
+        if not to_process:
+            console.print("[green]All emails already preprocessed![/green]")
+            display.show_overview(self.state)
+            return []
 
-            for i, email in enumerate(emails_to_process, 1):
-                mid = email["message_id"]
-                try:
-                    result = self.process_single_email(email, index=i, total=len(emails_to_process))
-                    processed.append(result)
-                except KeyboardInterrupt:
-                    self.state.set_error(mid, "Interrupted by user", PipelineStage.LLM_EXTRACTED)
-                    console.print(f"\n[yellow]Paused at email {i}/{len(emails_to_process)}. State saved. Run again to resume.[/yellow]")
-                    self.state.set_status("paused")
-                    return processed
-                except Exception as e:
-                    self.state.set_error(mid, str(e), PipelineStage.LLM_EXTRACTED)
-                    console.print(f"[red]Error processing '{mid}': {e}[/red]")
+        console.print(f"[bold]Preprocessing {len(to_process)} emails...[/bold]")
+        processed = []
 
-        # Phase 2: Embed and store (skip already stored)
+        for i, email in enumerate(to_process, 1):
+            mid = email["message_id"]
+            try:
+                result = self.process_single_email(email, index=i, total=len(to_process))
+                processed.append(result)
+            except KeyboardInterrupt:
+                self.state.set_error(mid, "Interrupted by user", PipelineStage.LLM_EXTRACTED)
+                console.print(f"\n[yellow]Paused at {i}/{len(to_process)}. Run again to resume.[/yellow]")
+                self.state.set_status("paused")
+                break
+            except Exception as e:
+                self.state.set_error(mid, str(e), PipelineStage.LLM_EXTRACTED)
+                console.print(f"[red]Error: {e}[/red]")
+
+        if self.state.is_complete():
+            self.state.mark_complete()
+
+        display.show_overview(self.state)
+        return processed
+
+    def run_embed(self, limit: int = 0) -> int:
+        """Only embed and store already-preprocessed emails.
+
+        Reads from data/processed/, chunks, embeds, stores in Qdrant.
+        Chat will see these immediately.
+        """
+        # Find emails that are preprocessed but not yet stored
         needs_embedding = self.state.get_emails_needing_processing(PipelineStage.STORED)
 
-        # Load processed emails from disk for embedding
-        processed_for_embedding = []
+        # Load processed emails from disk
+        to_embed = []
         for mid in needs_embedding:
             filepath = f"data/processed/{mid}.json"
             if os.path.exists(filepath):
                 with open(filepath) as f:
                     data = json.load(f)
                     data["date"] = datetime.fromisoformat(data["date"])
-                    processed_for_embedding.append(ProcessedEmail(**data))
+                    to_embed.append(ProcessedEmail(**data))
 
-        if not processed_for_embedding:
-            console.print("[green]All emails already embedded — skipping Phase 2[/green]")
-        else:
-            console.print(f"\n[bold]Phase 2: Embedding {len(processed_for_embedding)} emails...[/bold]")
+        if limit > 0:
+            to_embed = to_embed[:limit]
 
-            for i, email in enumerate(processed_for_embedding, 1):
-                try:
-                    self.embed_and_store_single(email, index=i, total=len(processed_for_embedding))
-                except KeyboardInterrupt:
-                    self.state.set_error(email.message_id, "Interrupted by user", PipelineStage.EMBEDDED)
-                    console.print(f"\n[yellow]Paused at email {i}/{len(processed_for_embedding)}. State saved. Run again to resume.[/yellow]")
-                    self.state.set_status("paused")
-                    break
-                except Exception as e:
-                    self.state.set_error(email.message_id, str(e), PipelineStage.EMBEDDED)
-                    console.print(f"[red]Error embedding '{email.message_id}': {e}[/red]")
+        if not to_embed:
+            console.print("[green]All preprocessed emails already embedded![/green]")
+            display.show_overview(self.state)
+            return 0
 
-        # Final stats
+        console.print(f"[bold]Embedding {len(to_embed)} emails...[/bold]")
+
+        for i, email in enumerate(to_embed, 1):
+            try:
+                self.embed_and_store_single(email, index=i, total=len(to_embed))
+            except KeyboardInterrupt:
+                self.state.set_error(email.message_id, "Interrupted by user", PipelineStage.EMBEDDED)
+                console.print(f"\n[yellow]Paused at {i}/{len(to_embed)}. Run again to resume.[/yellow]")
+                self.state.set_status("paused")
+                break
+            except Exception as e:
+                self.state.set_error(email.message_id, str(e), PipelineStage.EMBEDDED)
+                console.print(f"[red]Error: {e}[/red]")
+
         if self.state.is_complete():
             self.state.mark_complete()
 
         display.show_overview(self.state)
+        return len(to_embed)
 
-        # Return all processed emails
+    def run(self, emails: list[dict]) -> list[ProcessedEmail]:
+        """Run both phases: preprocess + embed."""
+        self.run_preprocess(emails)
+        self.run_embed()
+
+        # Return all stored emails
         all_processed = []
         for mid in self.state.get_emails_at_stage(PipelineStage.STORED):
             filepath = f"data/processed/{mid}.json"
@@ -344,35 +361,57 @@ class PreprocessingPipeline:
                     data = json.load(f)
                     data["date"] = datetime.fromisoformat(data["date"])
                     all_processed.append(ProcessedEmail(**data))
-
         return all_processed
 
 
+# ── CLI entry points ──
+
 def main():
-    """CLI entry point for preprocessing."""
-    raw_dir = "data/raw_emails"
-    if not os.path.exists(raw_dir):
+    """CLI: email-preprocess [--limit N]
+
+    Only preprocesses (LLM/VLM). Does NOT embed.
+    """
+    limit = 0
+    if "--limit" in sys.argv:
+        idx = sys.argv.index("--limit")
+        if idx + 1 < len(sys.argv):
+            limit = int(sys.argv[idx + 1])
+
+    emails = _load_raw_emails()
+    if not emails:
         console.print("[red]No raw emails found. Run email-ingest first.[/red]")
         return
 
-    emails = []
-    for filename in sorted(os.listdir(raw_dir)):
-        if filename.endswith(".json"):
-            with open(os.path.join(raw_dir, filename)) as f:
-                email = json.load(f)
-                email["date"] = datetime.fromisoformat(email["date"])
-                emails.append(email)
-
-    console.print(f"Loaded {len(emails)} emails from {raw_dir}")
+    if limit > 0:
+        console.print(f"[dim]Limiting to {limit} emails[/dim]")
 
     state = PipelineStateManager()
-
-    # Show resume info if this is a resumed run
     if state.status == "paused" or state.total_emails > 0:
         display.show_resume_info(state)
 
     pipeline = PreprocessingPipeline(state_manager=state)
-    pipeline.run(emails)
+    pipeline.run_preprocess(emails, limit=limit)
+
+
+def main_embed():
+    """CLI: email-embed [--limit N]
+
+    Only embeds already-preprocessed emails into Qdrant.
+    """
+    limit = 0
+    if "--limit" in sys.argv:
+        idx = sys.argv.index("--limit")
+        if idx + 1 < len(sys.argv):
+            limit = int(sys.argv[idx + 1])
+
+    state = PipelineStateManager()
+    if state.total_emails == 0:
+        console.print("[yellow]No pipeline state. Run email-ingest + email-preprocess first.[/yellow]")
+        return
+
+    display.show_resume_info(state)
+    pipeline = PreprocessingPipeline(state_manager=state)
+    pipeline.run_embed(limit=limit)
 
 
 if __name__ == "__main__":
