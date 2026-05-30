@@ -1,0 +1,22 @@
+[project]
+name = "chat-with-your-emails"
+version = "0.1.0"
+description = "Privacy-first email RAG pipeline using local LLMs via Ollama"
+requires-python = ">=3.10"
+dependencies = [
+    "google-api-python-client>=2.100.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.0",
+    "ollama>=0.4.0",
+    "qdrant-client>=1.12.0",
+    "pydantic>=2.0.0",
+    "rich>=13.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+email-ingest = "src.ingestion.gmail_client:main"
+email-preprocess = "src.preprocessing.pipeline:main"
+email-chat = "src.chat.app:main"
