@@ -25,7 +25,7 @@ class GmailConfig(BaseModel):
 class ModelsConfig(BaseModel):
     # Pre-processing
     text_llm: str = "qwen3:8b"
-    vision_llm: str = "qwen3-vl:8b"
+    vision_llm: str = "qwen2.5vl:7b"
     # Embedding
     embedding: str = "bge-m3:latest"
     embedding_dim: int = 1024
@@ -40,6 +40,10 @@ class AppConfig(BaseModel):
     models: ModelsConfig = ModelsConfig()
     chunk_size: int = 512
     chunk_overlap: int = 64
+    # Max attachment size to process (bytes) — skip very large files
+    max_attachment_size: int = 20 * 1024 * 1024  # 20MB
+    # Max images per email to describe (skip rest to save time)
+    max_images_per_email: int = 10
 
 
 config = AppConfig()
