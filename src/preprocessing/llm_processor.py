@@ -6,6 +6,7 @@ Extracts maximum detail from email content — never loses context.
 import json
 import ollama
 from config.settings import config
+from src.ollama_lock import get_model_lock
 
 EXTRACTION_PROMPT = """You are an expert email analyst. Your job is to extract EVERY piece of meaningful information from this email. Do NOT summarize away details — capture everything.
 
@@ -154,11 +155,12 @@ class LLMProcessor:
         )
 
         try:
-            response = self.client.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                options={"temperature": 0.1},
-            )
+            with get_model_lock():
+                response = self.client.chat(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0.1},
+                )
             content = response["message"]["content"].strip()
 
             # Try to extract JSON from response

@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from config.settings import config
 from src.embedding.embedder import EmailEmbedder
+from src.ollama_lock import get_model_lock
 from src.storage.vector_store import EmailVectorStore
 from src.tracking.state import PipelineStateManager, PipelineStatus
 
@@ -76,11 +77,12 @@ async def chat(request: ChatRequest):
         "content": f"Context from emails:\n\n{context}\n\nQuestion: {request.message}",
     })
 
-    response = llm_client.chat(
-        model=config.models.chat,
-        messages=messages,
-        options={"temperature": 0.3},
-    )
+    with get_model_lock():
+        response = llm_client.chat(
+            model=config.models.chat,
+            messages=messages,
+            options={"temperature": 0.3},
+        )
 
     return ChatResponse(
         response=response["message"]["content"],

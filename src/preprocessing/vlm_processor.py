@@ -7,6 +7,7 @@ Handles:
 
 import ollama
 from config.settings import config
+from src.ollama_lock import get_model_lock
 
 # Classify image attachments
 CLASSIFY_PROMPT = """Classify this image into exactly ONE category. Reply with ONLY the category name, nothing else.
@@ -76,15 +77,16 @@ class VLMProcessor:
     def classify_image(self, image_data: bytes, mime_type: str) -> str:
         """Classify an image to decide if it's worth processing."""
         try:
-            response = self.client.chat(
-                model=self.model,
-                messages=[{
-                    "role": "user",
-                    "content": CLASSIFY_PROMPT,
-                    "images": [{"data": image_data, "mime_type": mime_type}],
-                }],
-                options={"temperature": 0.0},
-            )
+            with get_model_lock():
+                response = self.client.chat(
+                    model=self.model,
+                    messages=[{
+                        "role": "user",
+                        "content": CLASSIFY_PROMPT,
+                        "images": [{"data": image_data, "mime_type": mime_type}],
+                    }],
+                    options={"temperature": 0.0},
+                )
             return response["message"]["content"].strip().upper().split("\n")[0].strip()
         except Exception:
             return "OTHER"
@@ -92,15 +94,16 @@ class VLMProcessor:
     def describe_image(self, image_data: bytes, mime_type: str, filename: str) -> str:
         """Generate detailed description of a meaningful image attachment."""
         try:
-            response = self.client.chat(
-                model=self.model,
-                messages=[{
-                    "role": "user",
-                    "content": DESCRIBE_IMAGE_PROMPT,
-                    "images": [{"data": image_data, "mime_type": mime_type}],
-                }],
-                options={"temperature": 0.1},
-            )
+            with get_model_lock():
+                response = self.client.chat(
+                    model=self.model,
+                    messages=[{
+                        "role": "user",
+                        "content": DESCRIBE_IMAGE_PROMPT,
+                        "images": [{"data": image_data, "mime_type": mime_type}],
+                    }],
+                    options={"temperature": 0.1},
+                )
             return response["message"]["content"].strip()
         except Exception as e:
             return f"Error describing image {filename}: {e}"
@@ -109,15 +112,16 @@ class VLMProcessor:
         """Describe a document page converted to image."""
         prompt = DESCRIBE_SCANNED_PROMPT if is_scanned else DESCRIBE_DOCUMENT_PAGE_PROMPT.format(page_num=page_num)
         try:
-            response = self.client.chat(
-                model=self.model,
-                messages=[{
-                    "role": "user",
-                    "content": prompt,
-                    "images": [{"data": image_data, "mime_type": "image/png"}],
-                }],
-                options={"temperature": 0.1},
-            )
+            with get_model_lock():
+                response = self.client.chat(
+                    model=self.model,
+                    messages=[{
+                        "role": "user",
+                        "content": prompt,
+                        "images": [{"data": image_data, "mime_type": "image/png"}],
+                    }],
+                    options={"temperature": 0.1},
+                )
             return response["message"]["content"].strip()
         except Exception as e:
             return f"Error processing page {page_num} of {filename}: {e}"
