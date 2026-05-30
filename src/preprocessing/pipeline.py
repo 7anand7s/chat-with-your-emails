@@ -1,9 +1,13 @@
-"""Full preprocessing pipeline:
-1. Clean email body (strip signatures, quotes, disclaimers, tracking)
-2. Extract text from document attachments (PDF, DOCX, XLSX, etc.)
-3. Classify & describe image attachments via VLM (skip logos/signatures)
-4. LLM extracts detailed structured data
-5. Chunk, embed, and store in Qdrant
+"""Full preprocessing pipeline — nothing is lost, everything is analyzed.
+
+Pipeline stages:
+1. Body cleaning: flag sections (never delete), extract links
+2. Attachment processing:
+   a. Documents → text extraction + page images → VLM for page descriptions
+   b. Images → classify (skip noise) → describe meaningful ones
+   c. Encrypted PDFs → decrypt with stored passwords
+3. LLM extraction: maximum detail structured data
+4. Chunk → embed (bge-m3) → store (Qdrant)
 """
 
 import json
@@ -39,53 +43,80 @@ class PreprocessingPipeline:
         """Run the full preprocessing pipeline on a single email."""
         attachments = email.get("attachments", [])
 
-        # Step 1: Clean the body
-        cleaned_body = self.body_cleaner.clean(email.get("raw_body", ""))
-        links = self.body_cleaner.extract_links(email.get("raw_body", ""))
+        # ═══════════════════════════════════════════════
+        # STAGE 1: Body cleaning (flag, never delete)
+        # ═══════════════════════════════════════════════
+        cleaned = self.body_cleaner.clean(email.get("raw_body", ""))
 
-        # Step 2: Process attachments
-        attachment_info = []        # Combined list for LLM context
+        # ═══════════════════════════════════════════════
+        # STAGE 2: Attachment processing
+        # ═══════════════════════════════════════════════
+        attachment_info = []          # Combined list for LLM context
         attachment_descriptions = []  # VLM image descriptions
-        attachment_contents = []     # Document text extracts
-        attachment_skipped = []      # Skipped files
+        attachment_page_descriptions = []  # VLM document page descriptions
+        attachment_contents = []      # Document text extracts
+        attachment_skipped = []       # Skipped files
 
         for att in attachments:
-            # Try document extraction first
-            doc_text = self.doc_extractor.extract(att.filename, att.mime_type, att.data)
-            if doc_text:
-                attachment_contents.append(f"[{att.filename}]: {doc_text[:3000]}")
-                attachment_info.append(f"Document {att.filename}: {doc_text[:500]}")
+            # Try document extraction
+            doc = self.doc_extractor.extract(att.filename, att.mime_type, att.data)
+
+            if doc is not None:
+                # Document with text content
+                attachment_contents.append(f"[{att.filename}]: {doc.text[:5000]}")
+                attachment_info.append(f"Document {att.filename} ({doc.metadata.get('type', 'unknown')}): {doc.text[:1000]}")
+
+                # If document has page images, send to VLM
+                if doc.images:
+                    page_descs = self.vlm.process_document_images(
+                        doc.images, att.filename, is_scanned=doc.is_scanned
+                    )
+                    attachment_page_descriptions.extend(page_descs)
+                    attachment_info.extend(page_descs)
+
+                # If scanned with no images (pdf2image not installed), note it
+                if doc.is_scanned and not doc.images:
+                    attachment_info.append(f"[{att.filename}]: Scanned document — install pdf2image for VLM page analysis")
+
                 continue
 
-            # Image — let VLM classify and describe
+            # Image — classify and describe
             if att.mime_type.startswith("image/"):
                 if att.size < 500:
                     attachment_skipped.append(att.filename)
                     continue
 
                 category = self.vlm.classify_image(att.data, att.mime_type)
+
                 if category in self.vlm.skip_categories:
                     attachment_skipped.append(att.filename)
                     continue
 
                 desc = self.vlm.describe_image(att.data, att.mime_type, att.filename)
                 attachment_descriptions.append(f"[{att.filename} ({category})]: {desc}")
-                attachment_info.append(f"Image {att.filename}: {desc}")
+                attachment_info.append(f"Image {att.filename} ({category}): {desc}")
                 continue
 
             # Unsupported type
             attachment_skipped.append(att.filename)
-            attachment_info.append(f"{att.filename}: unsupported file type ({att.mime_type})")
+            attachment_info.append(f"{att.filename}: unsupported type ({att.mime_type})")
 
-        # Step 3: LLM extraction
+        # ═══════════════════════════════════════════════
+        # STAGE 3: LLM extraction (maximum detail)
+        # ═══════════════════════════════════════════════
         llm_result = self.llm.process_email(
             email=email,
-            cleaned_body=cleaned_body,
+            cleaned_body=cleaned.primary_text,
+            full_body=cleaned.full_text,
+            noise_ratio=cleaned.noise_ratio,
+            section_flags=[s.to_dict() for s in cleaned.sections],
             attachment_info=attachment_info,
-            links=links,
+            links=cleaned.links,
         )
 
-        # Step 4: Build processed email
+        # ═══════════════════════════════════════════════
+        # STAGE 4: Build processed email
+        # ═══════════════════════════════════════════════
         return ProcessedEmail(
             message_id=email["message_id"],
             thread_id=email["thread_id"],
@@ -96,7 +127,10 @@ class PreprocessingPipeline:
             date=email["date"],
             labels=email.get("labels", []),
             raw_body=email["raw_body"],
-            cleaned_body=cleaned_body,
+            cleaned_body=cleaned.primary_text,
+            full_body=cleaned.full_text,
+            body_sections=[s.to_dict() for s in cleaned.sections],
+            noise_ratio=cleaned.noise_ratio,
             summary=llm_result.get("summary", ""),
             category=llm_result.get("category", ""),
             subcategory=llm_result.get("subcategory", ""),
@@ -106,17 +140,27 @@ class PreprocessingPipeline:
             questions_asked=llm_result.get("questions_asked", []),
             decisions_made=llm_result.get("decisions_made", []),
             deadlines_mentioned=llm_result.get("deadlines_mentioned", []),
+            financial_info=llm_result.get("financial_info", {}),
+            dates_and_times=llm_result.get("dates_and_times", {}),
             sentiment=llm_result.get("sentiment", ""),
             tone=llm_result.get("tone", ""),
             topics=llm_result.get("topics", []),
             requires_response=llm_result.get("requires_response", False),
             is_important=llm_result.get("is_important", False),
             is_thread_starter=llm_result.get("is_thread_starter", False),
+            is_automated=llm_result.get("is_automated", False),
+            is_promotional=llm_result.get("is_promotional", False),
+            is_financial=llm_result.get("is_financial", False),
+            is_legal=llm_result.get("is_legal", False),
+            is_transactional=llm_result.get("is_transactional", False),
             relationship=llm_result.get("relationship", ""),
+            email_type=llm_result.get("email_type", ""),
+            context_for_future_queries=llm_result.get("context_for_future_queries", ""),
             attachment_descriptions=attachment_descriptions,
+            attachment_page_descriptions=attachment_page_descriptions,
             attachment_contents=attachment_contents,
             attachment_skipped=attachment_skipped,
-            links=links,
+            links=cleaned.links,
         )
 
     def process_emails(self, emails: list[dict]) -> list[ProcessedEmail]:
@@ -144,7 +188,7 @@ class PreprocessingPipeline:
             task = progress.add_task("Embedding & storing...", total=len(processed_emails))
 
             for email in processed_emails:
-                # Build searchable text from all extracted data
+                # Build searchable text from ALL extracted data
                 email_dict = {
                     "message_id": email.message_id,
                     "subject": email.subject,
@@ -162,10 +206,14 @@ class PreprocessingPipeline:
                     "questions_asked": email.questions_asked,
                     "decisions_made": email.decisions_made,
                     "deadlines_mentioned": email.deadlines_mentioned,
+                    "financial_info": email.financial_info,
                     "relationship": email.relationship,
                     "sentiment": email.sentiment,
                     "tone": email.tone,
+                    "email_type": email.email_type,
+                    "context_for_future_queries": email.context_for_future_queries,
                     "attachment_descriptions": email.attachment_descriptions,
+                    "attachment_page_descriptions": email.attachment_page_descriptions,
                     "attachment_contents": email.attachment_contents,
                     "links": email.links,
                     "raw_body": email.cleaned_body,
@@ -210,9 +258,15 @@ class PreprocessingPipeline:
         total_chunks = sum(len(e.chunks) for e in processed)
         console.print(f"  Chunks created: {total_chunks}")
         total_att_desc = sum(len(e.attachment_descriptions) for e in processed)
+        total_page_desc = sum(len(e.attachment_page_descriptions) for e in processed)
         total_att_skip = sum(len(e.attachment_skipped) for e in processed)
-        console.print(f"  Images described: {total_att_desc}")
-        console.print(f"  Images skipped (logos/sig/etc): {total_att_skip}")
+        total_doc_contents = sum(len(e.attachment_contents) for e in processed)
+        console.print(f"  Images described (VLM): {total_att_desc}")
+        console.print(f"  Document pages described (VLM): {total_page_desc}")
+        console.print(f"  Documents text-extracted: {total_doc_contents}")
+        console.print(f"  Attachments skipped (noise): {total_att_skip}")
+        avg_noise = sum(e.noise_ratio for e in processed) / max(len(processed), 1)
+        console.print(f"  Avg noise ratio: {avg_noise:.0%}")
         info = self.store.get_collection_info()
         console.print(f"  Vector store: {info['points_count']} chunks in '{config.qdrant.collection}'")
 

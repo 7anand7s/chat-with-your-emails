@@ -16,22 +16,73 @@ class EmailChunker:
         """Create chunks from a processed email with metadata."""
         chunks = []
 
-        # Build the full searchable text from structured data
+        # Build the full searchable text from ALL structured data
         parts = []
         parts.append(f"Subject: {email.get('subject', '')}")
         parts.append(f"From: {email.get('sender', '')}")
         parts.append(f"To: {', '.join(email.get('to', []))}")
+        if email.get('cc'):
+            parts.append(f"CC: {', '.join(email['cc'])}")
         parts.append(f"Date: {email.get('date', '')}")
         parts.append(f"Category: {email.get('category', '')}")
+        if email.get('subcategory'):
+            parts.append(f"Subcategory: {email['subcategory']}")
+        if email.get('email_type'):
+            parts.append(f"Type: {email['email_type']}")
+        if email.get('relationship'):
+            parts.append(f"Relationship: {email['relationship']}")
         parts.append(f"Summary: {email.get('summary', '')}")
+
+        # Entities
+        entities = email.get('entities', {})
+        if isinstance(entities, dict):
+            for key, values in entities.items():
+                if values:
+                    parts.append(f"{key.replace('_', ' ').title()}: {', '.join(str(v) for v in values)}")
+        elif isinstance(entities, list):
+            parts.append(f"Entities: {', '.join(str(e) for e in entities)}")
+
         if email.get("topics"):
             parts.append(f"Topics: {', '.join(email['topics'])}")
-        if email.get("entities"):
-            parts.append(f"Entities: {', '.join(email['entities'])}")
-        if email.get("action_items"):
-            parts.append(f"Action items: {'. '.join(email['action_items'])}")
+
+        # Action items
+        action_items = email.get("action_items", [])
+        if action_items:
+            if isinstance(action_items[0], dict):
+                parts.append(f"Action items: {'. '.join(a.get('task', str(a)) for a in action_items)}")
+            else:
+                parts.append(f"Action items: {'. '.join(str(a) for a in action_items)}")
+
+        if email.get("key_information"):
+            parts.append(f"Key information: {'. '.join(email['key_information'])}")
+        if email.get("questions_asked"):
+            parts.append(f"Questions: {'. '.join(email['questions_asked'])}")
+        if email.get("decisions_made"):
+            parts.append(f"Decisions: {'. '.join(email['decisions_made'])}")
+        if email.get("deadlines_mentioned"):
+            parts.append(f"Deadlines: {'. '.join(email['deadlines_mentioned'])}")
+
+        # Financial info
+        fin = email.get("financial_info", {})
+        if fin.get("is_financial"):
+            parts.append(f"Financial: {fin.get('transaction_type', '')} - {', '.join(fin.get('amounts', []))}")
+
+        # Attachment descriptions (images + doc pages + text)
         if email.get("attachment_descriptions"):
-            parts.append(f"Attachments: {'; '.join(email['attachment_descriptions'])}")
+            parts.append(f"Image attachments: {'; '.join(email['attachment_descriptions'])}")
+        if email.get("attachment_page_descriptions"):
+            parts.append(f"Document pages: {'; '.join(email['attachment_page_descriptions'])}")
+        if email.get("attachment_contents"):
+            parts.append(f"Document contents: {'; '.join(email['attachment_contents'][:3])}")
+
+        if email.get("links"):
+            parts.append(f"Links: {', '.join(email['links'][:10])}")
+
+        # Future query context (synonyms, related terms)
+        if email.get("context_for_future_queries"):
+            parts.append(f"Search context: {email['context_for_future_queries']}")
+
+        # Body
         parts.append(f"Body: {email.get('raw_body', '')}")
 
         full_text = "\n".join(parts)
