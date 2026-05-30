@@ -33,3 +33,6 @@ dependencies = [
 email-ingest = "src.ingestion.gmail_client:main"
 email-preprocess = "src.preprocessing.pipeline:main"
 email-chat = "src.chat.app:main"
+email-status = "src.cli:status"
+email-resume = "src.cli:resume"
+email-reset = "src.cli:reset"

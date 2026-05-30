@@ -1,7 +1,7 @@
 """Qdrant vector store for email embeddings."""
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
 from config.settings import config
 
 
@@ -68,6 +68,23 @@ class EmailVectorStore:
             }
             for r in results.points
         ]
+
+    def delete_by_message_id(self, message_id: str):
+        """Delete all chunks for a given email (deduplication on re-run)."""
+        try:
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key="message_id",
+                            match=MatchValue(value=message_id),
+                        )
+                    ]
+                ),
+            )
+        except Exception:
+            pass  # Collection might be empty or not exist yet
 
     def get_collection_info(self) -> dict:
         """Get collection statistics."""

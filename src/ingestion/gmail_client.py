@@ -1,4 +1,11 @@
-"""Gmail API client for fetching emails."""
+"""Gmail API client for fetching emails.
+
+Features:
+- Saves raw emails to data/raw_emails/
+- Saves attachment binary data to data/attachments/{message_id}/
+- Deduplicates: skips already-fetched message_ids
+- Tracks state via PipelineStateManager
+"""
 
 import base64
 import json
@@ -13,6 +20,7 @@ from googleapiclient.discovery import build
 
 from config.settings import config
 from src.models import EmailAttachment
+from src.tracking.state import PipelineStage, PipelineStateManager
 
 
 class GmailClient:
@@ -105,7 +113,6 @@ class GmailClient:
             return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
 
         if payload.get("mimeType") == "text/html" and payload.get("body", {}).get("data"):
-            # We'll use the LLM to extract text from HTML later if needed
             return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
 
         for part in payload.get("parts", []):
@@ -135,38 +142,84 @@ class GmailClient:
                     size=len(data),
                 ))
 
-            # Recurse into nested parts
             if part.get("parts"):
                 attachments.extend(self._extract_attachments(message_id, part))
 
         return attachments
 
 
+def save_email(email: dict, save_attachments: bool = True):
+    """Save a fetched email to disk.
+
+    - JSON metadata to data/raw_emails/{message_id}.json
+    - Attachment binaries to data/attachments/{message_id}/{filename}
+    """
+    mid = email["message_id"]
+
+    # Save JSON metadata (without attachment bytes)
+    os.makedirs("data/raw_emails", exist_ok=True)
+    filepath = f"data/raw_emails/{mid}.json"
+    email_copy = {**email, "date": email["date"].isoformat()}
+    email_copy["attachments"] = [
+        {"filename": a.filename, "mime_type": a.mime_type, "size": a.size}
+        for a in email["attachments"]
+    ]
+    with open(filepath, "w") as f:
+        json.dump(email_copy, f, indent=2)
+
+    # Save attachment binaries
+    if save_attachments and email["attachments"]:
+        att_dir = f"data/attachments/{mid}"
+        os.makedirs(att_dir, exist_ok=True)
+        for att in email["attachments"]:
+            att_path = os.path.join(att_dir, att.filename)
+            with open(att_path, "wb") as f:
+                f.write(att.data)
+
+
 def main():
     """CLI entry point for fetching emails."""
     from rich.console import Console
+    from rich.progress import Progress
     console = Console()
+
+    state = PipelineStateManager()
+
+    # Get already-fetched message IDs to skip
+    raw_dir = "data/raw_emails"
+    existing = set()
+    if os.path.exists(raw_dir):
+        existing = {f.replace(".json", "") for f in os.listdir(raw_dir) if f.endswith(".json")}
 
     console.print("[bold]Fetching emails from Gmail...[/bold]")
     client = GmailClient()
-    emails = client.fetch_emails(max_results=10)
-    console.print(f"Fetched {len(emails)} emails")
+    emails = client.fetch_emails(max_results=100)
+    console.print(f"Fetched {len(emails)} emails from Gmail API")
 
-    # Save to disk for preprocessing
-    os.makedirs("data/raw_emails", exist_ok=True)
-    for email in emails:
-        filepath = f"data/raw_emails/{email['message_id']}.json"
-        # Convert datetime for JSON serialization
-        email_copy = {**email, "date": email["date"].isoformat()}
-        # Don't save raw attachment bytes to JSON
-        email_copy["attachments"] = [
-            {"filename": a.filename, "mime_type": a.mime_type, "size": a.size}
-            for a in email["attachments"]
-        ]
-        with open(filepath, "w") as f:
-            json.dump(email_copy, f, indent=2)
+    # Filter out already-fetched
+    new_emails = [e for e in emails if e["message_id"] not in existing]
+    skipped = len(emails) - len(new_emails)
+    if skipped > 0:
+        console.print(f"[dim]Skipping {skipped} already-fetched emails[/dim]")
 
-    console.print(f"Saved {len(emails)} emails to data/raw_emails/")
+    if not new_emails:
+        console.print("[green]No new emails to save[/green]")
+        return
+
+    # Register in state and save
+    subjects = {e["message_id"]: e.get("subject", "") for e in new_emails}
+    senders = {e["message_id"]: e.get("sender", "") for e in new_emails}
+    state.register_emails([e["message_id"] for e in new_emails], subjects=subjects, senders=senders)
+
+    with Progress() as progress:
+        task = progress.add_task("Saving emails...", total=len(new_emails))
+        for email in new_emails:
+            save_email(email)
+            state.set_stage(email["message_id"], PipelineStage.FETCHED)
+            progress.advance(task)
+
+    console.print(f"[green]Saved {len(new_emails)} new emails to {raw_dir}/[/green]")
+    console.print(f"Attachments saved to data/attachments/")
 
 
 if __name__ == "__main__":

@@ -1,13 +1,25 @@
-"""Chat interface using FastAPI + Ollama RAG."""
+"""Chat interface using FastAPI + Ollama RAG.
+
+Endpoints:
+- POST /api/chat — RAG chat against email database
+- GET /api/stats — Qdrant collection stats
+- GET /api/pipeline/status — full pipeline state
+- GET /api/pipeline/progress — stage counts + percentages
+- GET /api/pipeline/errors — failed emails
+- POST /api/pipeline/resume — trigger resume run (background)
+- POST /api/pipeline/pause — pause the pipeline
+"""
+
+import threading
 
 import ollama
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
+from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 
 from config.settings import config
 from src.embedding.embedder import EmailEmbedder
 from src.storage.vector_store import EmailVectorStore
+from src.tracking.state import PipelineStateManager, PipelineStatus
 
 app = FastAPI(title="Chat with Your Emails")
 
@@ -24,7 +36,7 @@ When referencing emails, mention the sender, date, and subject when available.""
 
 class ChatRequest(BaseModel):
     message: str
-    history: list[dict] = []  # [{"role": "user"/"assistant", "content": "..."}]
+    history: list[dict] = []
 
 
 class ChatResponse(BaseModel):
@@ -32,15 +44,13 @@ class ChatResponse(BaseModel):
     sources: list[dict] = []
 
 
+# ── Chat endpoints ──
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    # 1. Embed the query
     query_embedding = embedder.embed_text(request.message)
-
-    # 2. Search for relevant email chunks
     results = store.search(query_embedding, limit=5)
 
-    # 3. Build context from search results
     context_parts = []
     sources = []
     for i, r in enumerate(results):
@@ -58,13 +68,9 @@ async def chat(request: ChatRequest):
 
     context = "\n\n---\n\n".join(context_parts)
 
-    # 4. Generate response with LLM
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    # Add conversation history
-    for msg in request.history[-10:]:  # Keep last 10 messages for context
+    for msg in request.history[-10:]:
         messages.append(msg)
-
     messages.append({
         "role": "user",
         "content": f"Context from emails:\n\n{context}\n\nQuestion: {request.message}",
@@ -86,6 +92,77 @@ async def chat(request: ChatRequest):
 async def stats():
     return store.get_collection_info()
 
+
+# ── Pipeline status endpoints ──
+
+@app.get("/api/pipeline/status")
+async def pipeline_status():
+    """Full pipeline state."""
+    state = PipelineStateManager()
+    return state.get_progress()
+
+
+@app.get("/api/pipeline/progress")
+async def pipeline_progress():
+    """Stage counts and percentages."""
+    state = PipelineStateManager()
+    progress = state.get_progress()
+    return {
+        "status": progress["status"],
+        "total": progress["total_emails"],
+        "overall_pct": progress["overall_pct"],
+        "stages": progress["stages"],
+        "errors": progress["total_errors"],
+    }
+
+
+@app.get("/api/pipeline/errors")
+async def pipeline_errors():
+    """List all failed emails with errors."""
+    state = PipelineStateManager()
+    return {"errors": state.get_failed_emails()}
+
+
+@app.post("/api/pipeline/resume")
+async def pipeline_resume(background_tasks: BackgroundTasks):
+    """Trigger a pipeline resume in the background."""
+    state = PipelineStateManager()
+    if state.status == PipelineStatus.RUNNING.value:
+        return {"status": "already_running", "message": "Pipeline is already running"}
+
+    state.set_status(PipelineStatus.RUNNING)
+
+    def _run_resume():
+        import json
+        from datetime import datetime
+        from src.preprocessing.pipeline import PreprocessingPipeline
+
+        state = PipelineStateManager()
+        raw_dir = "data/raw_emails"
+        emails = []
+        for filename in sorted(__import__("os").listdir(raw_dir)):
+            if filename.endswith(".json"):
+                with open(f"{raw_dir}/{filename}") as f:
+                    email = json.load(f)
+                    email["date"] = datetime.fromisoformat(email["date"])
+                    emails.append(email)
+
+        pipeline = PreprocessingPipeline(state_manager=state)
+        pipeline.run(emails)
+
+    background_tasks.add_task(_run_resume)
+    return {"status": "resumed", "message": "Pipeline resume started in background"}
+
+
+@app.post("/api/pipeline/pause")
+async def pipeline_pause():
+    """Pause the pipeline (checked on next email)."""
+    state = PipelineStateManager()
+    state.set_status(PipelineStatus.PAUSED)
+    return {"status": "paused", "message": "Pipeline will pause after current email completes"}
+
+
+# ── Server startup ──
 
 def main():
     """Start the chat server."""
