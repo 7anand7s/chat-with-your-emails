@@ -299,19 +299,8 @@ class PreprocessingPipeline:
 
     def run_preprocess(self, emails: list[dict], limit: int = 0) -> list[ProcessedEmail]:
         """Preprocess emails concurrently using ThreadPoolExecutor."""
-        if limit > 0:
-            emails = emails[:limit]
 
-        # Register
-        subjects = {e["message_id"]: e.get("subject", "") for e in emails}
-        senders = {e["message_id"]: e.get("sender", "") for e in emails}
-        self.state.register_emails([e["message_id"] for e in emails], subjects=subjects, senders=senders)
-
-        # Filter to those needing preprocessing
-        needs_processing = self.state.get_emails_needing_processing(PipelineStage.LLM_EXTRACTED)
-        to_process = [e for e in emails if e["message_id"] in needs_processing]
-
-        # Also detect stale "unknown" emails from failed LLM calls — retry them
+        # Step 1: Detect stale "unknown" emails BEFORE applying limit
         stale = []
         proc_dir = "data/processed"
         if os.path.exists(proc_dir):
@@ -326,7 +315,6 @@ class PreprocessingPipeline:
                         mid = data.get("message_id", fname.replace(".json", ""))
                         stale.append(mid)
                         os.remove(filepath)
-                        # Reset stage so it gets picked up for reprocessing
                         if mid in self.state._state.get("emails", {}):
                             self.state._state["emails"][mid]["stage"] = None
                             self.state._state["emails"][mid]["error"] = None
@@ -336,8 +324,20 @@ class PreprocessingPipeline:
         if stale:
             self.state.save()
             print(f"Found {len(stale)} stale unknown emails — will retry")
-            stale_emails = [e for e in emails if e["message_id"] in stale]
-            to_process.extend(stale_emails)
+
+        # Step 2: Register ALL emails (not just limited) so state is complete
+        subjects = {e["message_id"]: e.get("subject", "") for e in emails}
+        senders = {e["message_id"]: e.get("sender", "") for e in emails}
+        self.state.register_emails([e["message_id"] for e in emails], subjects=subjects, senders=senders)
+
+        # Step 3: Find all emails needing preprocessing (includes stale ones)
+        needs_processing = self.state.get_emails_needing_processing(PipelineStage.LLM_EXTRACTED)
+        email_map = {e["message_id"]: e for e in emails}
+        to_process = [email_map[mid] for mid in needs_processing if mid in email_map]
+
+        # Step 4: Apply limit AFTER finding all candidates
+        if limit > 0:
+            to_process = to_process[:limit]
 
         if not to_process:
             print("All emails already preprocessed!")
