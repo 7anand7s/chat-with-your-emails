@@ -29,8 +29,9 @@ import ollama
 # ── Configuration ──
 
 HOMESERVER = os.environ.get("MATRIX_HOMESERVER", "http://192.168.0.250:8008")
-USER = os.environ.get("MATRIX_USER", "7anand7s")
-PASSWORD = os.environ.get("MATRIX_PASSWORD", "EmailAssistant2026!")
+USER_ID = os.environ.get("MATRIX_USER_ID", "@bot:7anand7s.com")
+USER = os.environ.get("MATRIX_USER", "bot")
+PASSWORD = os.environ.get("MATRIX_PASSWORD", "bot123")
 STORE_PATH = os.environ.get("MATRIX_STORE", "data/matrix_store")
 
 SYSTEM_PROMPT = """You are a helpful email assistant. You have access to the user's email database.
@@ -98,7 +99,7 @@ def query_emails(question: str) -> str:
 
 class EmailBot:
     def __init__(self):
-        self.client = AsyncClient(HOMESERVER, USER)
+        self.client = AsyncClient(HOMESERVER, USER_ID)
         self.client.store_path = STORE_PATH
         self.room_id = None
 
