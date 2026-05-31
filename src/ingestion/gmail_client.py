@@ -1,15 +1,16 @@
 """Gmail API client for fetching emails.
 
 Features:
-- Saves raw emails to data/raw_emails/
-- Saves attachment binary data to data/attachments/{message_id}/
-- Deduplicates: skips already-fetched message_ids
-- Tracks state via PipelineStateManager
+- Saves each email immediately as it's fetched (crash-safe)
+- Skips already-fetched message_ids
+- tqdm progress bar during fetch
+- Saves attachments to data/attachments/{message_id}/
 """
 
 import base64
 import json
 import os
+import sys
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 
@@ -17,6 +18,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from tqdm import tqdm
 
 from config.settings import config
 from src.models import EmailAttachment
@@ -42,7 +44,7 @@ class GmailClient:
                 if not os.path.exists(creds_path):
                     raise FileNotFoundError(
                         f"Gmail credentials file not found: {creds_path}\n"
-                        "Download it from Google Cloud Console → APIs → Credentials → OAuth 2.0"
+                        "Download from Google Cloud Console → APIs & Services → Credentials → OAuth 2.0"
                     )
                 flow = InstalledAppFlow.from_client_secrets_file(creds_path, config.gmail.scopes)
                 creds = flow.run_local_server(port=0)
@@ -53,13 +55,13 @@ class GmailClient:
 
         return build("gmail", "v1", credentials=creds)
 
-    def fetch_emails(self, max_results: int = 100, query: str = "") -> list[dict]:
-        """Fetch email messages from Gmail."""
-        messages = []
+    def _get_message_ids(self, max_results: int = 100, query: str = "") -> list[str]:
+        """Get message IDs only (fast, no content)."""
+        ids = []
         page_token = None
 
-        while len(messages) < max_results:
-            batch_size = min(100, max_results - len(messages))
+        while len(ids) < max_results:
+            batch_size = min(100, max_results - len(ids))
             result = self.service.users().messages().list(
                 userId="me",
                 maxResults=batch_size,
@@ -71,21 +73,23 @@ class GmailClient:
             if not msg_list:
                 break
 
-            for msg_meta in msg_list:
-                msg = self.service.users().messages().get(
-                    userId="me",
-                    id=msg_meta["id"],
-                    format="full",
-                ).execute()
-                messages.append(self._parse_message(msg))
-                if len(messages) >= max_results:
+            for m in msg_list:
+                ids.append(m["id"])
+                if len(ids) >= max_results:
                     break
 
             page_token = result.get("nextPageToken")
             if not page_token:
                 break
 
-        return messages
+        return ids
+
+    def get_message(self, message_id: str) -> dict:
+        """Fetch a single message by ID."""
+        msg = self.service.users().messages().get(
+            userId="me", id=message_id, format="full"
+        ).execute()
+        return self._parse_message(msg)
 
     def _parse_message(self, msg: dict) -> dict:
         """Parse a Gmail message into our format."""
@@ -148,15 +152,11 @@ class GmailClient:
         return attachments
 
 
-def save_email(email: dict, save_attachments: bool = True):
-    """Save a fetched email to disk.
-
-    - JSON metadata to data/raw_emails/{message_id}.json
-    - Attachment binaries to data/attachments/{message_id}/{filename}
-    """
+def save_email(email: dict):
+    """Save a fetched email to disk."""
     mid = email["message_id"]
 
-    # Save JSON metadata (without attachment bytes)
+    # Save JSON metadata
     os.makedirs("data/raw_emails", exist_ok=True)
     filepath = f"data/raw_emails/{mid}.json"
     email_copy = {**email, "date": email["date"].isoformat()}
@@ -168,7 +168,7 @@ def save_email(email: dict, save_attachments: bool = True):
         json.dump(email_copy, f, indent=2)
 
     # Save attachment binaries
-    if save_attachments and email["attachments"]:
+    if email["attachments"]:
         att_dir = f"data/attachments/{mid}"
         os.makedirs(att_dir, exist_ok=True)
         for att in email["attachments"]:
@@ -178,54 +178,80 @@ def save_email(email: dict, save_attachments: bool = True):
 
 
 def main():
-    """CLI entry point for fetching emails.
+    """CLI: email-ingest [--limit N] [--query 'from:bank']
 
-    Usage: email-ingest [--limit N]
+    Fetches emails from Gmail, saves each one immediately.
+    Skips already-fetched emails. Can stop/resume anytime.
     """
-    import sys
-    from tqdm import tqdm
-
-    # Parse --limit
+    # Parse args
     limit = 100
-    if "--limit" in sys.argv:
-        idx = sys.argv.index("--limit")
-        if idx + 1 < len(sys.argv):
-            limit = int(sys.argv[idx + 1])
+    query = ""
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1])
+            i += 2
+        elif args[i] == "--query" and i + 1 < len(args):
+            query = args[i + 1]
+            i += 2
+        else:
+            i += 1
 
     state = PipelineStateManager()
 
-    # Get already-fetched message IDs to skip
+    # Already-fetched IDs (skip these)
     raw_dir = "data/raw_emails"
     existing = set()
     if os.path.exists(raw_dir):
         existing = {f.replace(".json", "") for f in os.listdir(raw_dir) if f.endswith(".json")}
 
     print(f"Fetching up to {limit} emails from Gmail...")
+    if existing:
+        print(f"Already on disk: {len(existing)} (will skip)")
+    if query:
+        print(f"Query: {query}")
+
     client = GmailClient()
-    emails = client.fetch_emails(max_results=limit)
-    print(f"Fetched {len(emails)} emails from Gmail API")
+
+    # Step 1: Get message IDs (fast)
+    print("Getting message list...")
+    message_ids = client._get_message_ids(max_results=limit, query=query)
+    print(f"Found {len(message_ids)} messages")
 
     # Filter out already-fetched
-    new_emails = [e for e in emails if e["message_id"] not in existing]
-    skipped = len(emails) - len(new_emails)
+    new_ids = [mid for mid in message_ids if mid not in existing]
+    skipped = len(message_ids) - len(new_ids)
     if skipped > 0:
-        print(f"Skipping {skipped} already-fetched emails")
-
-    if not new_emails:
-        print("No new emails to save")
+        print(f"Skipping {skipped} already on disk")
+    if not new_ids:
+        print("No new emails to fetch")
         return
 
-    # Register in state and save
-    subjects = {e["message_id"]: e.get("subject", "") for e in new_emails}
-    senders = {e["message_id"]: e.get("sender", "") for e in new_emails}
-    state.register_emails([e["message_id"] for e in new_emails], subjects=subjects, senders=senders)
+    # Step 2: Fetch + save each email immediately (with progress bar)
+    fetched = 0
+    errors = 0
 
-    for email in tqdm(new_emails, desc="Saving", unit="email"):
-        save_email(email)
-        state.set_stage(email["message_id"], PipelineStage.FETCHED)
+    for mid in tqdm(new_ids, desc="Fetching", unit="email"):
+        try:
+            email = client.get_message(mid)
+            save_email(email)
+            state.register_emails(
+                [mid],
+                subjects={mid: email.get("subject", "")},
+                senders={mid: email.get("sender", "")},
+            )
+            state.set_stage(mid, PipelineStage.FETCHED)
+            fetched += 1
+        except KeyboardInterrupt:
+            print(f"\nStopped. Fetched {fetched}/{len(new_ids)}. Re-run to resume.")
+            state.set_status("paused")
+            return
+        except Exception as e:
+            tqdm.write(f"  Error {mid}: {e}")
+            errors += 1
 
-    print(f"Saved {len(new_emails)} new emails to {raw_dir}/")
-    print(f"Attachments saved to data/attachments/")
+    print(f"\nDone: {fetched} fetched, {errors} errors, {skipped} skipped")
 
 
 if __name__ == "__main__":

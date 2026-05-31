@@ -29,6 +29,9 @@ dependencies = [
     "rich>=13.0.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["src*", "config*", "scripts*"]
+
 [project.scripts]
 email-ingest = "src.ingestion.gmail_client:main"
 email-preprocess = "src.preprocessing.pipeline:main"
