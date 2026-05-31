@@ -90,7 +90,7 @@ class EmailVectorStore:
         """Get collection statistics."""
         info = self.client.get_collection(self.collection)
         return {
-            "vectors_count": info.vectors_count,
+            "vectors_count": info.indexed_vectors_count,
             "points_count": info.points_count,
             "status": info.status,
         }
