@@ -183,9 +183,7 @@ def main():
     Usage: email-ingest [--limit N]
     """
     import sys
-    from rich.console import Console
-    from rich.progress import Progress
-    console = Console()
+    from tqdm import tqdm
 
     # Parse --limit
     limit = 100
@@ -202,19 +200,19 @@ def main():
     if os.path.exists(raw_dir):
         existing = {f.replace(".json", "") for f in os.listdir(raw_dir) if f.endswith(".json")}
 
-    console.print(f"[bold]Fetching up to {limit} emails from Gmail...[/bold]")
+    print(f"Fetching up to {limit} emails from Gmail...")
     client = GmailClient()
     emails = client.fetch_emails(max_results=limit)
-    console.print(f"Fetched {len(emails)} emails from Gmail API")
+    print(f"Fetched {len(emails)} emails from Gmail API")
 
     # Filter out already-fetched
     new_emails = [e for e in emails if e["message_id"] not in existing]
     skipped = len(emails) - len(new_emails)
     if skipped > 0:
-        console.print(f"[dim]Skipping {skipped} already-fetched emails[/dim]")
+        print(f"Skipping {skipped} already-fetched emails")
 
     if not new_emails:
-        console.print("[green]No new emails to save[/green]")
+        print("No new emails to save")
         return
 
     # Register in state and save
@@ -222,15 +220,12 @@ def main():
     senders = {e["message_id"]: e.get("sender", "") for e in new_emails}
     state.register_emails([e["message_id"] for e in new_emails], subjects=subjects, senders=senders)
 
-    with Progress() as progress:
-        task = progress.add_task("Saving emails...", total=len(new_emails))
-        for email in new_emails:
-            save_email(email)
-            state.set_stage(email["message_id"], PipelineStage.FETCHED)
-            progress.advance(task)
+    for email in tqdm(new_emails, desc="Saving", unit="email"):
+        save_email(email)
+        state.set_stage(email["message_id"], PipelineStage.FETCHED)
 
-    console.print(f"[green]Saved {len(new_emails)} new emails to {raw_dir}/[/green]")
-    console.print(f"Attachments saved to data/attachments/")
+    print(f"Saved {len(new_emails)} new emails to {raw_dir}/")
+    print(f"Attachments saved to data/attachments/")
 
 
 if __name__ == "__main__":
