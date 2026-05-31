@@ -6,7 +6,6 @@ Extracts maximum detail from email content — never loses context.
 import json
 import ollama
 from config.settings import config
-from src.ollama_lock import get_model_lock
 
 EXTRACTION_PROMPT = """You are an expert email analyst. Your job is to extract EVERY piece of meaningful information from this email. Do NOT summarize away details — capture everything.
 
@@ -155,12 +154,11 @@ class LLMProcessor:
         )
 
         try:
-            with get_model_lock():
-                response = self.client.chat(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    options={"temperature": 0.1},
-                )
+            response = self.client.chat(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.1},
+            )
             content = response["message"]["content"].strip()
 
             # Try to extract JSON from response
@@ -205,31 +203,9 @@ class LLMProcessor:
 
             return result
 
-        except (json.JSONDecodeError, KeyError, Exception) as e:
-            return {
-                "summary": f"Error processing email: {e}",
-                "category": "unknown",
-                "subcategory": "",
-                "entities": {},
-                "action_items": [],
-                "key_information": [],
-                "questions_asked": [],
-                "decisions_made": [],
-                "deadlines_mentioned": [],
-                "financial_info": {},
-                "dates_and_times": {},
-                "sentiment": "neutral",
-                "tone": "",
-                "topics": [],
-                "requires_response": False,
-                "is_important": False,
-                "is_thread_starter": False,
-                "is_automated": False,
-                "is_promotional": False,
-                "is_financial": False,
-                "is_legal": False,
-                "is_transactional": False,
-                "relationship": "",
-                "email_type": "",
-                "context_for_future_queries": "",
-            }
+        except json.JSONDecodeError as e:
+            # Bad JSON from LLM — retry later
+            raise RuntimeError(f"LLM returned invalid JSON: {e}") from e
+        except Exception as e:
+            # Ollama unreachable, timeout, etc. — retry later
+            raise RuntimeError(f"LLM call failed: {e}") from e

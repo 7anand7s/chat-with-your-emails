@@ -3,7 +3,6 @@
 import uuid
 import ollama
 from config.settings import config
-from src.ollama_lock import get_model_lock
 
 
 class EmailChunker:
@@ -128,12 +127,10 @@ class EmailEmbedder:
 
     def embed_text(self, text: str) -> list[float]:
         """Generate embedding for a single text."""
-        with get_model_lock():
-            response = self.client.embed(model=self.model, input=text)
+        response = self.client.embed(model=self.model, input=text)
         return response["embeddings"][0]
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for a batch of texts."""
-        with get_model_lock():
-            response = self.client.embed(model=self.model, input=texts)
+        response = self.client.embed(model=self.model, input=texts)
         return response["embeddings"]

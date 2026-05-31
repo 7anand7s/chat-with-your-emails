@@ -1,20 +1,20 @@
-"""Full preprocessing pipeline with tracking and resumability.
+"""Full preprocessing pipeline with tracking, resumability, and concurrency.
 
 Pipeline stages:
 fetched → cleaned → llm_extracted → vlm_processed → embedded → stored
 
-Three independent entry points:
-- run_preprocess(): only LLM/VLM extraction (saves to data/processed/)
-- run_embed(): only chunk/embed/store (reads from data/processed/)
-- run(): both phases together
-
-Each can be run independently, resumed, and stopped at any time.
-Chat always works with whatever is in Qdrant.
+Features:
+- ThreadPoolExecutor for concurrent LLM/VLM/embedding calls
+- tqdm progress bars
+- Crash-safe: saves each email immediately
+- Resume from where it left off
+- Deduplicates Qdrant on re-run
 """
 
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from tqdm import tqdm
 
@@ -27,6 +27,9 @@ from src.preprocessing.llm_processor import LLMProcessor
 from src.preprocessing.vlm_processor import VLMProcessor
 from src.storage.vector_store import EmailVectorStore
 from src.tracking.state import PipelineStage, PipelineStateManager
+
+# Number of concurrent workers (matches OLLAMA_NUM_PARALLEL)
+WORKERS = 4
 
 
 def _load_raw_emails(limit: int = 0) -> list[dict]:
@@ -59,10 +62,32 @@ class PreprocessingPipeline:
         self.store = EmailVectorStore()
         self.state = state_manager or PipelineStateManager()
 
+    def _normalize_attachments(self, attachments) -> list:
+        """Convert attachment dicts to EmailAttachment objects."""
+        from src.models import EmailAttachment
+        result = []
+        for att in attachments:
+            if isinstance(att, dict):
+                # Load from saved path if available, otherwise skip binary
+                saved_path = att.get("saved_path", "")
+                data = b""
+                if saved_path and os.path.exists(saved_path):
+                    with open(saved_path, "rb") as f:
+                        data = f.read()
+                result.append(EmailAttachment(
+                    filename=att.get("filename", "unknown"),
+                    mime_type=att.get("mime_type", "application/octet-stream"),
+                    data=data,
+                    size=att.get("size", 0),
+                ))
+            else:
+                result.append(att)
+        return result
+
     def process_single_email(self, email: dict) -> ProcessedEmail:
         """Run the full preprocessing pipeline on a single email."""
         mid = email["message_id"]
-        attachments = email.get("attachments", [])
+        attachments = self._normalize_attachments(email.get("attachments", []))
 
         # ── Stage 1: Body cleaning ──
         cleaned = self.body_cleaner.clean(email.get("raw_body", ""))
@@ -76,39 +101,57 @@ class PreprocessingPipeline:
         attachment_skipped = []
 
         for att in attachments:
-            doc = self.doc_extractor.extract(att.filename, att.mime_type, att.data)
+            # Handle both dict (from JSON) and EmailAttachment objects
+            if isinstance(att, dict):
+                att_filename = att.get("filename", "")
+                att_mime = att.get("mime_type", "")
+                att_size = att.get("size", 0)
+                # Load binary from disk if saved
+                att_data = att.get("data", b"")
+                if not att_data:
+                    att_path = f"data/attachments/{mid}/{att_filename}"
+                    if os.path.exists(att_path):
+                        with open(att_path, "rb") as f:
+                            att_data = f.read()
+            else:
+                att_filename = att.filename
+                att_mime = att.mime_type
+                att_size = att.size
+                att_data = att.data
+
+            doc = self.doc_extractor.extract(att_filename, att_mime, att_data)
 
             if doc is not None:
-                attachment_contents.append(f"[{att.filename}]: {doc.text[:5000]}")
-                attachment_info.append(f"Document {att.filename} ({doc.metadata.get('type', 'unknown')}): {doc.text[:1000]}")
+                attachment_contents.append(f"[{att_filename}]: {doc.text[:5000]}")
+                attachment_info.append(f"Document {att_filename} ({doc.metadata.get('type', 'unknown')}): {doc.text[:1000]}")
 
                 if doc.images:
                     page_descs = self.vlm.process_document_images(
-                        doc.images, att.filename, is_scanned=doc.is_scanned
+                        doc.images, att_filename, is_scanned=doc.is_scanned
                     )
                     attachment_page_descriptions.extend(page_descs)
                     attachment_info.extend(page_descs)
 
                 continue
 
-            if att.mime_type.startswith("image/"):
-                if att.size < 500:
-                    attachment_skipped.append(att.filename)
+            if att_mime.startswith("image/"):
+                if att_size < 500:
+                    attachment_skipped.append(att_filename)
                     continue
 
-                category = self.vlm.classify_image(att.data, att.mime_type)
+                category = self.vlm.classify_image(att_data, att_mime)
 
                 if category in self.vlm.skip_categories:
-                    attachment_skipped.append(att.filename)
+                    attachment_skipped.append(att_filename)
                     continue
 
-                desc = self.vlm.describe_image(att.data, att.mime_type, att.filename)
-                attachment_descriptions.append(f"[{att.filename} ({category})]: {desc}")
-                attachment_info.append(f"Image {att.filename} ({category}): {desc}")
+                desc = self.vlm.describe_image(att_data, att_mime, att_filename)
+                attachment_descriptions.append(f"[{att_filename} ({category})]: {desc}")
+                attachment_info.append(f"Image {att_filename} ({category}): {desc}")
                 continue
 
-            attachment_skipped.append(att.filename)
-            attachment_info.append(f"{att.filename}: unsupported type ({att.mime_type})")
+            attachment_skipped.append(att_filename)
+            attachment_info.append(f"{att_filename}: unsupported type ({att_mime})")
 
         self.state.set_stage(mid, PipelineStage.VLM_PROCESSED)
 
@@ -233,10 +276,29 @@ class PreprocessingPipeline:
         self.state.set_chunks_created(mid, len(chunks))
         self.state.set_stage(mid, PipelineStage.STORED)
 
+    def _preprocess_one(self, email: dict) -> tuple[str, str | None]:
+        """Preprocess a single email. Returns (message_id, error_or_None)."""
+        mid = email["message_id"]
+        try:
+            self.process_single_email(email)
+            return (mid, None)
+        except Exception as e:
+            self.state.set_error(mid, str(e), PipelineStage.LLM_EXTRACTED)
+            return (mid, str(e))
+
+    def _embed_one(self, email: ProcessedEmail) -> tuple[str, str | None]:
+        """Embed a single email. Returns (message_id, error_or_None)."""
+        try:
+            self.embed_and_store_single(email)
+            return (email.message_id, None)
+        except Exception as e:
+            self.state.set_error(email.message_id, str(e), PipelineStage.EMBEDDED)
+            return (email.message_id, str(e))
+
     # ── Independent entry points ──
 
     def run_preprocess(self, emails: list[dict], limit: int = 0) -> list[ProcessedEmail]:
-        """Only preprocess (LLM/VLM extraction). Does NOT embed."""
+        """Preprocess emails concurrently using ThreadPoolExecutor."""
         if limit > 0:
             emails = emails[:limit]
 
@@ -249,40 +311,62 @@ class PreprocessingPipeline:
         needs_processing = self.state.get_emails_needing_processing(PipelineStage.LLM_EXTRACTED)
         to_process = [e for e in emails if e["message_id"] in needs_processing]
 
+        # Also detect stale "unknown" emails from failed LLM calls — retry them
+        stale = []
+        for mid in self.state.get_emails_at_stage(PipelineStage.STORED):
+            filepath = f"data/processed/{mid}.json"
+            if os.path.exists(filepath):
+                with open(filepath) as f:
+                    data = json.load(f)
+                if data.get("category") == "unknown" and "Error" in data.get("summary", ""):
+                    stale.append(mid)
+                    os.remove(filepath)
+                    self.state.set_stage(mid, PipelineStage.FETCHED)  # Reset to re-process
+
+        if stale:
+            print(f"Found {len(stale)} stale emails with errors — will retry")
+            stale_emails = [e for e in emails if e["message_id"] in stale]
+            to_process.extend(stale_emails)
+
         if not to_process:
             print("All emails already preprocessed!")
             return []
 
-        print(f"Preprocessing {len(to_process)} emails...")
-        processed = []
+        print(f"Preprocessing {len(to_process)} emails with {WORKERS} workers...")
         errors = 0
 
-        for email in tqdm(to_process, desc="Preprocessing", unit="email"):
-            mid = email["message_id"]
-            subject = email.get("subject", "")[:50]
-            try:
-                tqdm.write(f"  → {subject}")
-                result = self.process_single_email(email)
-                processed.append(result)
-                tqdm.write(f"    ✓ {result.category} | {len(result.key_information)} facts | {len(result.attachment_descriptions)} images")
-            except KeyboardInterrupt:
-                self.state.set_error(mid, "Interrupted by user", PipelineStage.LLM_EXTRACTED)
-                print(f"\nPaused. Run again to resume.")
-                self.state.set_status("paused")
-                break
-            except Exception as e:
-                self.state.set_error(mid, str(e), PipelineStage.LLM_EXTRACTED)
-                tqdm.write(f"    ✗ ERROR: {e}")
-                errors += 1
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            futures = {executor.submit(self._preprocess_one, email): email for email in to_process}
+
+            with tqdm(total=len(to_process), desc="Preprocessing", unit="email") as pbar:
+                for future in as_completed(futures):
+                    mid, error = future.result()
+                    email = futures[future]
+                    subject = email.get("subject", "")[:50]
+
+                    if error:
+                        tqdm.write(f"  ✗ {subject}: {error}")
+                        errors += 1
+                    else:
+                        # Load the processed email to show stats
+                        filepath = f"data/processed/{mid}.json"
+                        if os.path.exists(filepath):
+                            with open(filepath) as f:
+                                data = json.load(f)
+                            tqdm.write(f"  ✓ {subject} | {data.get('category', '')} | {len(data.get('key_information', []))} facts")
+                        else:
+                            tqdm.write(f"  ✓ {subject}")
+
+                    pbar.update(1)
 
         if self.state.is_complete():
             self.state.mark_complete()
 
-        print(f"\nDone: {len(processed)} preprocessed, {errors} errors")
-        return processed
+        print(f"\nDone: {len(to_process) - errors} preprocessed, {errors} errors")
+        return []
 
     def run_embed(self, limit: int = 0) -> int:
-        """Only embed and store already-preprocessed emails."""
+        """Embed preprocessed emails concurrently using ThreadPoolExecutor."""
         needs_embedding = self.state.get_emails_needing_processing(PipelineStage.STORED)
 
         to_embed = []
@@ -301,23 +385,24 @@ class PreprocessingPipeline:
             print("All preprocessed emails already embedded!")
             return 0
 
-        print(f"Embedding {len(to_embed)} emails...")
+        print(f"Embedding {len(to_embed)} emails with {WORKERS} workers...")
         errors = 0
 
-        for email in tqdm(to_embed, desc="Embedding", unit="email"):
-            try:
-                tqdm.write(f"  → {email.subject[:50]}")
-                self.embed_and_store_single(email)
-                tqdm.write(f"    ✓ {len(email.chunks)} chunks")
-            except KeyboardInterrupt:
-                self.state.set_error(email.message_id, "Interrupted by user", PipelineStage.EMBEDDED)
-                print(f"\nPaused. Run again to resume.")
-                self.state.set_status("paused")
-                break
-            except Exception as e:
-                self.state.set_error(email.message_id, str(e), PipelineStage.EMBEDDED)
-                tqdm.write(f"    ✗ ERROR: {e}")
-                errors += 1
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            futures = {executor.submit(self._embed_one, email): email for email in to_embed}
+
+            with tqdm(total=len(to_embed), desc="Embedding", unit="email") as pbar:
+                for future in as_completed(futures):
+                    mid, error = future.result()
+                    email = futures[future]
+
+                    if error:
+                        tqdm.write(f"  ✗ {email.subject[:50]}: {error}")
+                        errors += 1
+                    else:
+                        tqdm.write(f"  ✓ {email.subject[:50]} | {len(email.chunks)} chunks")
+
+                    pbar.update(1)
 
         if self.state.is_complete():
             self.state.mark_complete()
