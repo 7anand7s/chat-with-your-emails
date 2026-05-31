@@ -313,18 +313,29 @@ class PreprocessingPipeline:
 
         # Also detect stale "unknown" emails from failed LLM calls — retry them
         stale = []
-        for mid in self.state.get_emails_at_stage(PipelineStage.STORED):
-            filepath = f"data/processed/{mid}.json"
-            if os.path.exists(filepath):
-                with open(filepath) as f:
-                    data = json.load(f)
-                if data.get("category") == "unknown" and "Error" in data.get("summary", ""):
-                    stale.append(mid)
-                    os.remove(filepath)
-                    self.state.set_stage(mid, PipelineStage.FETCHED)  # Reset to re-process
+        proc_dir = "data/processed"
+        if os.path.exists(proc_dir):
+            for fname in os.listdir(proc_dir):
+                if not fname.endswith(".json"):
+                    continue
+                filepath = os.path.join(proc_dir, fname)
+                try:
+                    with open(filepath) as f:
+                        data = json.load(f)
+                    if data.get("category") == "unknown" and "Error" in data.get("summary", ""):
+                        mid = data.get("message_id", fname.replace(".json", ""))
+                        stale.append(mid)
+                        os.remove(filepath)
+                        # Reset stage so it gets picked up for reprocessing
+                        if mid in self.state._state.get("emails", {}):
+                            self.state._state["emails"][mid]["stage"] = None
+                            self.state._state["emails"][mid]["error"] = None
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
         if stale:
-            print(f"Found {len(stale)} stale emails with errors — will retry")
+            self.state.save()
+            print(f"Found {len(stale)} stale unknown emails — will retry")
             stale_emails = [e for e in emails if e["message_id"] in stale]
             to_process.extend(stale_emails)
 
