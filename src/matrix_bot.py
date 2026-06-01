@@ -29,9 +29,16 @@ ADMIN_PASSWORD = os.environ.get("MATRIX_ADMIN_PASSWORD", "admin123")
 STORE_PATH = "data/matrix_store"
 
 SYSTEM_PROMPT = """You are a helpful email assistant. Answer based on the email context provided.
-Be concise. Reference sender, date, and subject. If context is insufficient, say so.
-Use simple formatting: bullet points with - and bold with **text**.
-Do NOT use markdown headers (#) — just use plain text with bullet points."""
+Be concise. Reference sender, date, and subject.
+
+FORMATTING RULES:
+- Use - for bullet points (never use * or numbers)
+- Use **text** for bold
+- NEVER use angle brackets < or > — they break the chat display
+- NEVER use markdown headers (# ## ###)
+- NEVER use code blocks or backticks
+- NEVER use HTML tags
+- Keep it clean and readable as plain text with bullets and bold only"""
 
 embedder = EmailEmbedder()
 store = EmailVectorStore()
@@ -144,7 +151,9 @@ def query_emails(question: str) -> str:
         )
 
         answer = response["message"]["content"]
-        sources = [f"- {r['subject'][:50]} — {r['sender'][:30]}" for r in results]
+        # Strip angle brackets from LLM output (breaks HTML rendering)
+        answer = answer.replace("<", "(").replace(">", ")")
+        sources = [f"- {r['subject']} — {r['sender']}" for r in results]
         return f"{answer}\n\n**Sources:**\n" + "\n".join(sources)
 
     except Exception as e:
