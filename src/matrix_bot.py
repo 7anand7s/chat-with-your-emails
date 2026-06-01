@@ -1,20 +1,19 @@
 """Matrix bot for chatting with your emails.
 
 Connects to Matrix Synapse, listens for messages, queries email RAG, replies.
+Uses HTML formatting for clean display in Element.
 
 Usage: email-matrix
 """
 
 import asyncio
-import hashlib
-import hmac
 import json
 import os
 import sys
-import time
+import re
 
 import requests
-from nio import AsyncClient, MatrixRoom, RoomMessageText, LoginResponse, MatrixInvitedRoom
+from nio import AsyncClient, MatrixRoom, RoomMessageText, MatrixInvitedRoom
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,15 +24,14 @@ import ollama
 
 HOMESERVER = os.environ.get("MATRIX_HOMESERVER", "http://192.168.0.250:8008")
 USER_ID = os.environ.get("MATRIX_USER_ID", "@bot:7anand7s.com")
-USER = os.environ.get("MATRIX_USER", "bot")
-PASSWORD = os.environ.get("MATRIX_PASSWORD", "bot123")
 ADMIN_USER = os.environ.get("MATRIX_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("MATRIX_ADMIN_PASSWORD", "admin123")
 STORE_PATH = "data/matrix_store"
 
 SYSTEM_PROMPT = """You are a helpful email assistant. Answer based on the email context provided.
 Be concise. Reference sender, date, and subject. If context is insufficient, say so.
-Format for chat — use bullet points, bold for key info."""
+Use simple formatting: bullet points with - and bold with **text**.
+Do NOT use markdown headers (#) — just use plain text with bullet points."""
 
 embedder = EmailEmbedder()
 store = EmailVectorStore()
@@ -41,7 +39,7 @@ llm_client = ollama.Client(host=config.ollama.base_url)
 
 
 def get_admin_token() -> str:
-    """Get admin access token via registration shared secret."""
+    """Get admin access token."""
     r = requests.post(f"{HOMESERVER}/_matrix/client/r0/login", json={
         "type": "m.login.password",
         "identifier": {"type": "m.id.user", "user": ADMIN_USER},
@@ -52,17 +50,67 @@ def get_admin_token() -> str:
     raise RuntimeError(f"Admin login failed: {r.json()}")
 
 
-def get_bot_token_via_admin() -> str:
-    """Get a bot access token via admin API (bypasses login rate limits)."""
+def get_bot_token() -> str:
+    """Get bot access token via admin API (bypasses login rate limits)."""
     admin_token = get_admin_token()
     r = requests.post(
-        f"{HOMESERVER}/_synapse/admin/v1/users/@{USER}:{HOMESERVER.split('//')[1].split(':')[0]}/login",
+        f"{HOMESERVER}/_synapse/admin/v1/users/{USER_ID}/login",
         headers={"Authorization": f"Bearer {admin_token}"},
         json={},
     )
     if r.status_code == 200:
         return r.json()["access_token"]
-    raise RuntimeError(f"Bot token creation failed: {r.json()}")
+    raise RuntimeError(f"Bot token failed: {r.json()}")
+
+
+def markdown_to_html(text: str) -> str:
+    """Convert simple markdown to Matrix HTML."""
+    # Escape HTML special chars
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Bold: **text** → <strong>text</strong>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+
+    # Bullet points: - text OR * text → <li>text</li>
+    lines = text.split('\n')
+    result = []
+    in_list = False
+    for line in lines:
+        stripped = line.strip()
+        # Match both "- " and "* " (with optional extra spaces)
+        bullet_match = re.match(r'^[-*]\s{1,4}(.+)', stripped)
+        if bullet_match:
+            if not in_list:
+                result.append('<ul>')
+                in_list = True
+            result.append(f'<li>{bullet_match.group(1)}</li>')
+        else:
+            if in_list:
+                result.append('</ul>')
+                in_list = False
+            if stripped:
+                result.append(f'<p>{stripped}</p>')
+            else:
+                result.append('<br/>')
+    if in_list:
+        result.append('</ul>')
+
+    return ''.join(result)
+
+
+def send_matrix_message(client, room_id: str, text: str):
+    """Send a message with HTML formatting."""
+    html = markdown_to_html(text)
+    return client.room_send(
+        room_id=room_id,
+        message_type="m.room.message",
+        content={
+            "msgtype": "m.text",
+            "body": text,
+            "format": "org.matrix.custom.html",
+            "formatted_body": html,
+        },
+    )
 
 
 def query_emails(question: str) -> str:
@@ -76,7 +124,7 @@ def query_emails(question: str) -> str:
         results = store.search(query_embedding, limit=5)
 
         if not results:
-            return "No relevant emails found."
+            return "No relevant emails found for that question."
 
         context_parts = []
         for i, r in enumerate(results):
@@ -97,7 +145,7 @@ def query_emails(question: str) -> str:
 
         answer = response["message"]["content"]
         sources = [f"- {r['subject'][:50]} — {r['sender'][:30]}" for r in results]
-        return f"{answer}\n\nSources:\n" + "\n".join(sources)
+        return f"{answer}\n\n**Sources:**\n" + "\n".join(sources)
 
     except Exception as e:
         return f"Error: {e}"
@@ -107,11 +155,9 @@ class EmailBot:
     def __init__(self):
         os.makedirs(STORE_PATH, exist_ok=True)
         self.client = AsyncClient(HOMESERVER, USER_ID, store_path=STORE_PATH)
-        self.room_id = None
 
     async def login(self):
-        """Log in using admin API to bypass rate limits."""
-        # Try restoring session first
+        """Log in using admin API (bypasses rate limits)."""
         try:
             await self.client.restore_login()
             print(f"Restored session for {self.client.user_id}")
@@ -119,38 +165,28 @@ class EmailBot:
         except Exception:
             pass
 
-        # Get token via admin API (bypasses login rate limits)
         try:
-            token = get_bot_token_via_admin()
+            token = get_bot_token()
             self.client.access_token = token
             self.client.user_id = USER_ID
-            print(f"Got bot token via admin API")
+            print(f"Logged in via admin API")
             return
         except Exception as e:
-            print(f"Admin API failed: {e}")
-
-        # Fallback to direct login
-        response = await self.client.login(PASSWORD, device_name="email-bot")
-        if isinstance(response, LoginResponse):
-            print(f"Logged in as {response.user_id}")
-        else:
-            print(f"Login failed: {response}")
+            print(f"Login failed: {e}")
             sys.exit(1)
 
     async def on_invite(self, room: MatrixInvitedRoom):
         """Auto-join when invited."""
-        print(f"Invited to room {room.room_id}, joining...")
-        resp = await self.client.join(room.room_id)
-        print(f"Joined: {resp}")
-        self.room_id = room.room_id
-        await self.client.room_send(
-            room_id=room.room_id,
-            message_type="m.room.message",
-            content={"msgtype": "m.text", "body": "Hi! I'm your email assistant. Ask me anything about your emails."},
+        print(f"Invited to {room.room_id}, joining...")
+        await self.client.join(room.room_id)
+        await send_matrix_message(
+            self.client, room.room_id,
+            "Hi! I'm your email assistant. Ask me anything about your emails."
         )
 
     async def on_message(self, room: MatrixRoom, event: RoomMessageText):
         """Handle incoming messages."""
+        # Ignore own messages
         if event.sender == USER_ID:
             return
 
@@ -160,43 +196,32 @@ class EmailBot:
 
         print(f"[{room.display_name}] {event.sender}: {question}")
 
-        # Query emails (non-blocking)
+        # Query RAG
         loop = asyncio.get_event_loop()
         answer = await loop.run_in_executor(None, query_emails, question)
 
-        # Send reply
-        await self.client.room_send(
-            room_id=room.room_id,
-            message_type="m.room.message",
-            content={"msgtype": "m.text", "body": answer},
-        )
+        # Send formatted reply
+        await send_matrix_message(self.client, room.room_id, answer)
         print(f"[Bot]: {answer[:100]}...")
 
     async def run(self):
         """Start the bot."""
         await self.login()
-
         self.client.add_event_callback(self.on_invite, MatrixInvitedRoom)
         self.client.add_event_callback(self.on_message, RoomMessageText)
 
         print("Syncing...")
         await self.client.sync(timeout=30000, full_state=True)
-
         for room_id, room in self.client.rooms.items():
-            print(f"In room: {room.display_name} ({room_id})")
+            print(f"  In room: {room.display_name}")
 
         print("Listening for messages...")
         await self.client.sync_forever(timeout=30000)
 
 
-async def _run():
-    bot = EmailBot()
-    await bot.run()
-
-
 def main():
     """CLI: email-matrix"""
-    asyncio.run(_run())
+    asyncio.run(EmailBot().run())
 
 
 if __name__ == "__main__":
